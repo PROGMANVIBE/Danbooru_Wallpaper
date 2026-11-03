@@ -1,0 +1,1723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="referrer" content="no-referrer" />
+  <title>Danbooru Infinite Scroll, Polaroid Collage & Fullscreen Slideshow</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    html, body {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background-color: #0b0b0d;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+    }
+    #collageBaseCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 0;
+      display: none;
+    }
+    #stage {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      contain: strict;
+      perspective: 1200px;
+      z-index: 1;
+    }
+    #freezeOverlayCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 9999;
+      display: none;
+    }
+
+    /* --- Continuous Scroll Item (Horizontal & Vertical) --- */
+    .slide-item {
+      position: absolute;
+      top: 0;
+      left: 0;
+      max-width: none;
+      max-height: none;
+      display: block;
+      will-change: transform;
+      backface-visibility: hidden;
+      user-select: none;
+      pointer-events: none;
+    }
+
+    /* --- Polaroid Collage Item --- */
+    .polaroid-item {
+      position: absolute;
+      top: 0;
+      left: 0;
+      background-color: #ffffff;
+      padding: 12px 12px 34px 12px;
+      border-radius: 3px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
+      transform-origin: center center;
+      user-select: none;
+      pointer-events: none;
+    }
+    .polaroid-item.falling {
+      will-change: transform, opacity;
+      box-shadow: 0 32px 64px rgba(0, 0, 0, 0.75), 0 8px 20px rgba(0, 0, 0, 0.45);
+    }
+    .polaroid-img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      user-select: none;
+      pointer-events: none;
+      background-color: #111;
+    }
+
+    /* --- Fullscreen Slideshow Item --- */
+    .slideshow-item {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: cover;
+      display: block;
+      will-change: opacity;
+      user-select: none;
+      pointer-events: none;
+    }
+  </style>
+<script src="/_aistudio-iframe.js?v=1f94f900"></script></head>
+<body>
+  <canvas id="collageBaseCanvas"></canvas>
+  <div id="stage"></div>
+  <canvas id="freezeOverlayCanvas"></canvas>
+
+  <script>
+    const stage = document.getElementById('stage');
+    const collageBaseCanvas = document.getElementById('collageBaseCanvas');
+    const collageCtx = collageBaseCanvas.getContext('2d');
+    const freezeOverlayCanvas = document.getElementById('freezeOverlayCanvas');
+    const freezeCtx = freezeOverlayCanvas.getContext('2d');
+
+    const LOCAL_ORIGIN = (window.location.origin && window.location.origin.startsWith('http'))
+      ? window.location.origin
+      : 'http://127.0.0.1:8088';
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const SCREEN_ID = urlParams.get('screen') || 'screen_1';
+
+    // --- Configurable Defaults (Overridden by Settings / project.json) ---
+    let SCREEN_ENABLED = true;
+    let APP_PAUSED = false;           // Master application pause (freezes everything)
+    let WALLPAPER_PAUSED = false;     // Search bar pause (pauses motion/transitions, keeps GIF/MP4 playing)
+
+    let DISPLAY_MODE = 'scroll';      // 'scroll' | 'collage' | 'slideshow'
+    let SCROLL_DIRECTION = 'left';    // 'left' | 'right' | 'up' | 'down'
+    let SCROLL_SPEED = 120;           // Pixels per second (0.1 to 600 px/s)
+    let GAP = 12;                     // Space between scrolling images in pixels
+
+    let COLLAGE_DROP_SPEED = 1.0;     // Speed multiplier (0.2x to 4.0x)
+    let COLLAGE_MIN_SIZE = 220;       // Minimum polaroid target dimension (px)
+    let COLLAGE_MAX_SIZE = 440;       // Maximum polaroid target dimension (px)
+    let COLLAGE_DROP_DELAY = 0;       // Extra delay between collage drops (0 to 600s)
+
+    let SLIDESHOW_FADE = 5.0;         // 0 to 10 (0 = 0s instant, 10 = 1.0s fade transition)
+    let SLIDESHOW_DURATION = 10;      // 0 to 600 seconds per slide
+
+    // --- Shared Queue & Parallel Preloader State ---
+    const BASE_PRELOAD_BUFFER_TARGET = 12;
+    let preloadBufferTarget = BASE_PRELOAD_BUFFER_TARGET;
+    const MAX_CONCURRENT_LOADS = 4;
+    const MIN_API_COOLDOWN_MS = 3000;
+    const LOW_QUEUE_THRESHOLD = 10;
+
+    let postQueue = [];
+    let readyImageQueue = [];         // Preloaded { media, isVideo, isAnimated, aspect, naturalW, naturalH }
+    let inFlightMedia = new Set();    // Active Image() or <video> elements currently downloading
+    let activePreloadCount = 0;
+    let preloadGeneration = 1;
+    let consecutiveLoadErrors = 0;
+    let preloaderBackoffUntil = 0;
+    let isFetching = false;
+    let nextAllowedFetchTime = 0;
+    let consecutiveEmptyFetches = 0;
+    let currentEpoch = null;
+    let lastTime = null;
+
+    // --- Scroll Mode State ---
+    let activeItems = [];
+
+    // --- Collage Mode State & Hybrid Canvas-Baking Tuning ---
+    const POLAROID_PAD_SIDE = 12;
+    const POLAROID_PAD_TOP = 12;
+    const POLAROID_PAD_BOTTOM = 34;
+
+    const MAX_LIVE_COLLAGE_DOM = 30;
+    const OCCLUDED_GRACE_DROPS = 4;
+    const COVERAGE_INSET_PX = 8;
+
+    let collageItems = [];
+    let fallingItems = [];
+    let timeSinceLastDrop = 999;
+    let nextZIndex = 1;
+    let nextPolaroidId = 1;
+    let fillScreenBurstRemaining = 0;
+
+    const GRID_COLS = 96;
+    const GRID_ROWS = 54;
+    const TOTAL_GRID_CELLS = GRID_COLS * GRID_ROWS;
+    let coverageGrid = new Int32Array(TOTAL_GRID_CELLS);
+    let coveredCellCount = 0;
+    let screenFullyCovered = false;
+
+    // --- Slideshow Mode State ---
+    let currentSlideItem = null;      // { element, mediaElement, isVideo, isAnimated, aspect }
+    let previousSlideItem = null;     // Outgoing slide during fade transition
+    let slideshowTimer = 0;
+    let slideshowFadeElapsed = 0;
+    let slideshowIsFading = false;
+    let activeFadeDurationSec = 0.5;
+
+    function isHorizontalScroll() {
+      return SCROLL_DIRECTION === 'left' || SCROLL_DIRECTION === 'right';
+    }
+
+    function isScreenLandscape() {
+      return window.innerWidth >= window.innerHeight;
+    }
+
+    function matchesScreenOrientation(aspect) {
+      if (!Number.isFinite(aspect) || aspect <= 0) return true;
+      const screenLandscape = isScreenLandscape();
+      return screenLandscape ? (aspect >= 1.0) : (aspect < 1.0);
+    }
+
+    function postMatchesScreenOrientation(post) {
+      if (!post) return false;
+      const w = Number(post.image_width || 0);
+      const h = Number(post.image_height || 0);
+      if (w > 0 && h > 0) {
+        return matchesScreenOrientation(w / h);
+      }
+      return true;
+    }
+
+    function buildLocalMediaUrl(post) {
+      if (!post) return '';
+      if (post.media_url && String(post.media_url).startsWith('http://127.0.0.1:')) {
+        return post.media_url;
+      }
+      if (post.proxy_url && String(post.proxy_url).startsWith('http://127.0.0.1:')) {
+        return post.proxy_url.replace('/image?', '/media?');
+      }
+      if (post.file_url) {
+        const ext = encodeURIComponent(String(post.file_ext || '').toLowerCase());
+        const size = encodeURIComponent(String(post.file_size || 0));
+        return `${LOCAL_ORIGIN}/media?url=${encodeURIComponent(post.file_url)}&ext=${ext}&size=${size}`;
+      }
+      return '';
+    }
+
+    function enforceSilentVideo(video) {
+      if (!video) return;
+      video.muted = true;
+      video.defaultMuted = true;
+      video.volume = 0;
+      video.setAttribute('muted', '');
+      video.setAttribute('playsinline', '');
+      video.playsInline = true;
+      video.loop = true;
+      video.addEventListener('volumechange', () => {
+        if (!video.muted || video.volume !== 0) {
+          video.muted = true;
+          video.volume = 0;
+        }
+      });
+    }
+
+    function resizeCollageCanvas(preserveContent = true) {
+      const dpr = window.devicePixelRatio || 1;
+      const targetW = Math.max(1, Math.round(window.innerWidth * dpr));
+      const targetH = Math.max(1, Math.round(window.innerHeight * dpr));
+
+      if (collageBaseCanvas.width === targetW && collageBaseCanvas.height === targetH) {
+        return;
+      }
+
+      let tempCanvas = null;
+      if (preserveContent && collageBaseCanvas.width > 0 && collageBaseCanvas.height > 0) {
+        tempCanvas = document.createElement('canvas');
+        tempCanvas.width = collageBaseCanvas.width;
+        tempCanvas.height = collageBaseCanvas.height;
+        tempCanvas.getContext('2d').drawImage(collageBaseCanvas, 0, 0);
+      }
+
+      collageBaseCanvas.width = targetW;
+      collageBaseCanvas.height = targetH;
+
+      if (tempCanvas) {
+        collageCtx.drawImage(tempCanvas, 0, 0, targetW, targetH);
+      }
+    }
+
+    function clearCollageCanvas() {
+      collageCtx.clearRect(0, 0, collageBaseCanvas.width, collageBaseCanvas.height);
+    }
+
+    function bakePolaroidToCanvas(item) {
+      if (!collageCtx || !item || !item.mediaElement) return;
+      const dpr = window.devicePixelRatio || 1;
+      const cx = item.targetX + item.totalW / 2;
+      const cy = item.targetY + item.totalH / 2;
+      const rad = (item.targetRot * Math.PI) / 180;
+      const halfW = item.totalW / 2;
+      const halfH = item.totalH / 2;
+      const imgW = item.totalW - POLAROID_PAD_SIDE * 2;
+      const imgH = item.totalH - POLAROID_PAD_TOP - POLAROID_PAD_BOTTOM;
+
+      collageCtx.save();
+      collageCtx.scale(dpr, dpr);
+      collageCtx.translate(cx, cy);
+      collageCtx.rotate(rad);
+
+      collageCtx.shadowColor = 'rgba(0, 0, 0, 0.55)';
+      collageCtx.shadowBlur = 24;
+      collageCtx.shadowOffsetX = 0;
+      collageCtx.shadowOffsetY = 8;
+      collageCtx.fillStyle = '#ffffff';
+      collageCtx.beginPath();
+      if (collageCtx.roundRect) {
+        collageCtx.roundRect(-halfW, -halfH, item.totalW, item.totalH, 3);
+      } else {
+        collageCtx.rect(-halfW, -halfH, item.totalW, item.totalH);
+      }
+      collageCtx.fill();
+
+      collageCtx.shadowColor = 'transparent';
+      collageCtx.shadowBlur = 0;
+      collageCtx.shadowOffsetY = 0;
+      collageCtx.fillStyle = '#111111';
+      collageCtx.fillRect(-halfW + POLAROID_PAD_SIDE, -halfH + POLAROID_PAD_TOP, imgW, imgH);
+
+      try {
+        collageCtx.drawImage(
+          item.mediaElement,
+          -halfW + POLAROID_PAD_SIDE,
+          -halfH + POLAROID_PAD_TOP,
+          imgW,
+          imgH
+        );
+      } catch (e) {}
+
+      collageCtx.restore();
+    }
+
+    function drawCoverMedia(ctx, media, x, y, w, h, aspect) {
+      if (!ctx || !media) return;
+      const targetAspect = w / Math.max(1, h);
+      const mediaAspect = aspect || targetAspect;
+      let drawW = w;
+      let drawH = h;
+      let offsetX = x;
+      let offsetY = y;
+
+      if (mediaAspect > targetAspect) {
+        drawH = h;
+        drawW = h * mediaAspect;
+        offsetX = x - (drawW - w) / 2;
+      } else {
+        drawW = w;
+        drawH = w / mediaAspect;
+        offsetY = y - (drawH - h) / 2;
+      }
+      try {
+        ctx.drawImage(media, offsetX, offsetY, drawW, drawH);
+      } catch (e) {}
+    }
+
+    // =========================================================================
+    // PAUSE & FREEZE CALLBACKS
+    // =========================================================================
+    function renderFreezeSnapshot() {
+      const dpr = window.devicePixelRatio || 1;
+      freezeOverlayCanvas.width = Math.max(1, Math.round(window.innerWidth * dpr));
+      freezeOverlayCanvas.height = Math.max(1, Math.round(window.innerHeight * dpr));
+      freezeCtx.save();
+      freezeCtx.scale(dpr, dpr);
+      freezeCtx.fillStyle = document.body.style.backgroundColor || '#0b0b0d';
+      freezeCtx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+      if (DISPLAY_MODE === 'scroll') {
+        for (let i = 0; i < activeItems.length; i++) {
+          const it = activeItems[i];
+          if (it.element) {
+            try {
+              freezeCtx.drawImage(it.element, it.x, it.y, it.width, it.height);
+            } catch (e) {}
+          }
+        }
+      } else if (DISPLAY_MODE === 'slideshow') {
+        if (previousSlideItem && previousSlideItem.mediaElement) {
+          freezeCtx.save();
+          freezeCtx.globalAlpha = Number(previousSlideItem.element.style.opacity || 1);
+          drawCoverMedia(
+            freezeCtx,
+            previousSlideItem.mediaElement,
+            0,
+            0,
+            window.innerWidth,
+            window.innerHeight,
+            previousSlideItem.aspect
+          );
+          freezeCtx.restore();
+        }
+        if (currentSlideItem && currentSlideItem.mediaElement) {
+          freezeCtx.save();
+          freezeCtx.globalAlpha = Number(currentSlideItem.element.style.opacity || 1);
+          drawCoverMedia(
+            freezeCtx,
+            currentSlideItem.mediaElement,
+            0,
+            0,
+            window.innerWidth,
+            window.innerHeight,
+            currentSlideItem.aspect
+          );
+          freezeCtx.restore();
+        }
+      } else {
+        try {
+          freezeCtx.drawImage(collageBaseCanvas, 0, 0, window.innerWidth, window.innerHeight);
+        } catch (e) {}
+        const allItems = collageItems.concat(fallingItems);
+        for (let i = 0; i < allItems.length; i++) {
+          const item = allItems[i];
+          if (!item.mediaElement) continue;
+          const isFalling = item.element && item.element.classList.contains('falling');
+          const progress = isFalling ? Math.min(item.elapsed / item.duration, 1.0) : 1.0;
+          const ease = 1 - Math.pow(1 - progress, 3);
+          const curX = isFalling ? item.startX + (item.targetX - item.startX) * ease : item.targetX;
+          const curY = isFalling ? item.startY + (item.targetY - item.startY) * ease : item.targetY;
+          const curScale = isFalling ? item.startScale + (item.targetScale - item.startScale) * ease : 1.0;
+          const curRot = isFalling ? item.startRot + (item.targetRot - item.startRot) * ease : item.targetRot;
+
+          const cx = curX + item.totalW / 2;
+          const cy = curY + item.totalH / 2;
+          const halfW = item.totalW / 2;
+          const halfH = item.totalH / 2;
+          const imgW = item.totalW - POLAROID_PAD_SIDE * 2;
+          const imgH = item.totalH - POLAROID_PAD_TOP - POLAROID_PAD_BOTTOM;
+
+          freezeCtx.save();
+          freezeCtx.translate(cx, cy);
+          freezeCtx.scale(curScale, curScale);
+          freezeCtx.rotate((curRot * Math.PI) / 180);
+          freezeCtx.fillStyle = '#ffffff';
+          freezeCtx.fillRect(-halfW, -halfH, item.totalW, item.totalH);
+          try {
+            freezeCtx.drawImage(
+              item.mediaElement,
+              -halfW + POLAROID_PAD_SIDE,
+              -halfH + POLAROID_PAD_TOP,
+              imgW,
+              imgH
+            );
+          } catch (e) {}
+          freezeCtx.restore();
+        }
+      }
+      freezeCtx.restore();
+    }
+
+    window.applyPauseStates = function(appPaused, wallpaperPaused) {
+      const prevAppPaused = APP_PAUSED;
+      APP_PAUSED = Boolean(appPaused);
+      WALLPAPER_PAUSED = Boolean(wallpaperPaused);
+
+      if (APP_PAUSED && !prevAppPaused) {
+        renderFreezeSnapshot();
+        freezeOverlayCanvas.style.display = 'block';
+        document.querySelectorAll('video').forEach(v => {
+          try { v.pause(); } catch (e) {}
+        });
+      } else if (!APP_PAUSED && prevAppPaused) {
+        freezeOverlayCanvas.style.display = 'none';
+        document.querySelectorAll('video').forEach(v => {
+          try {
+            enforceSilentVideo(v);
+            v.play().catch(() => {});
+          } catch (e) {}
+        });
+        consecutiveLoadErrors = 0;
+        preloaderBackoffUntil = 0;
+        lastTime = null;
+        pumpPreloader();
+      }
+    };
+
+    window.setScreenEnabled = function(enabled) {
+      const newEnabled = Boolean(enabled);
+      if (SCREEN_ENABLED === newEnabled) return;
+      SCREEN_ENABLED = newEnabled;
+      if (!SCREEN_ENABLED) {
+        clearReadyQueue();
+        clearStageAll();
+        stage.style.display = 'none';
+        collageBaseCanvas.style.display = 'none';
+      } else {
+        stage.style.display = 'block';
+        if (DISPLAY_MODE === 'collage') {
+          resizeCollageCanvas(false);
+          collageBaseCanvas.style.display = 'block';
+        }
+        consecutiveLoadErrors = 0;
+        preloaderBackoffUntil = 0;
+        nextAllowedFetchTime = 0;
+        timeSinceLastDrop = 999;
+        slideshowTimer = 999999;
+        pumpPreloader();
+        if (DISPLAY_MODE === 'scroll') {
+          fillScrollBuffer();
+        } else if (DISPLAY_MODE === 'slideshow') {
+          advanceSlideshowIfReady();
+        }
+      }
+    };
+
+    window.triggerFillCollageScreen = function() {
+      if (DISPLAY_MODE !== 'collage' || APP_PAUSED || !SCREEN_ENABLED) return;
+      screenFullyCovered = false;
+      fillScreenBurstRemaining = 28;
+      preloadBufferTarget = 32;
+      pumpPreloader();
+      drainFillScreenBurst();
+    };
+
+    function drainFillScreenBurst() {
+      if (DISPLAY_MODE !== 'collage' || fillScreenBurstRemaining <= 0 || APP_PAUSED) return;
+      while (fillScreenBurstRemaining > 0 && readyImageQueue.length > 0 && !screenFullyCovered) {
+        if (spawnNextCollageItem()) {
+          fillScreenBurstRemaining--;
+        } else {
+          break;
+        }
+      }
+      if (screenFullyCovered || fillScreenBurstRemaining <= 0) {
+        fillScreenBurstRemaining = 0;
+        preloadBufferTarget = BASE_PRELOAD_BUFFER_TARGET;
+        timeSinceLastDrop = 0;
+      } else {
+        pumpPreloader();
+      }
+    }
+
+    // =========================================================================
+    // NETWORK FETCH & STRICT LOCAL PYTHON PROXY PRELOADER (/media)
+    // =========================================================================
+    async function fetchNextPage(forceImmediate = false) {
+      if (isFetching || APP_PAUSED || !SCREEN_ENABLED) return;
+      const now = performance.now();
+      if (!forceImmediate && (now < nextAllowedFetchTime || now < preloaderBackoffUntil)) return;
+
+      isFetching = true;
+      nextAllowedFetchTime = now + MIN_API_COOLDOWN_MS;
+
+      try {
+        const res = await fetch(`${LOCAL_ORIGIN}/api?screen=${encodeURIComponent(SCREEN_ID)}`);
+        if (res.ok) {
+          const newPosts = await res.json();
+          if (Array.isArray(newPosts) && newPosts.length > 0) {
+            consecutiveEmptyFetches = 0;
+            nextAllowedFetchTime = performance.now() + MIN_API_COOLDOWN_MS;
+
+            if (DISPLAY_MODE === 'slideshow') {
+              const filtered = newPosts.filter(postMatchesScreenOrientation);
+              postQueue.push(...filtered);
+              if (filtered.length === 0) {
+                // Entire batch was opposite orientation; schedule next batch quickly so slideshow doesn't stall
+                nextAllowedFetchTime = performance.now() + 400;
+                setTimeout(() => fetchNextPage(), 420);
+              }
+            } else {
+              postQueue.push(...newPosts);
+            }
+            pumpPreloader();
+          } else {
+            consecutiveEmptyFetches++;
+            const backoffMs = Math.min(30000, MIN_API_COOLDOWN_MS * Math.pow(2, consecutiveEmptyFetches));
+            nextAllowedFetchTime = performance.now() + backoffMs;
+          }
+        } else {
+          consecutiveEmptyFetches++;
+          const backoffMs = Math.min(30000, MIN_API_COOLDOWN_MS * Math.pow(2, consecutiveEmptyFetches));
+          nextAllowedFetchTime = performance.now() + backoffMs;
+        }
+      } catch (err) {
+        consecutiveEmptyFetches++;
+        const backoffMs = Math.min(30000, MIN_API_COOLDOWN_MS * Math.pow(2, consecutiveEmptyFetches));
+        nextAllowedFetchTime = performance.now() + backoffMs;
+      } finally {
+        isFetching = false;
+      }
+    }
+
+    function finalizePreloadedMedia(mediaEl, gen, isVideo, isAnimated) {
+      if (!inFlightMedia.has(mediaEl)) return;
+      inFlightMedia.delete(mediaEl);
+      activePreloadCount = Math.max(0, activePreloadCount - 1);
+      consecutiveLoadErrors = 0;
+      preloaderBackoffUntil = 0;
+
+      if (gen !== preloadGeneration || APP_PAUSED || !SCREEN_ENABLED) {
+        cleanupMediaNode(mediaEl);
+        return;
+      }
+
+      const naturalW = isVideo ? (mediaEl.videoWidth || 16) : (mediaEl.naturalWidth || 1);
+      const naturalH = isVideo ? (mediaEl.videoHeight || 9) : (mediaEl.naturalHeight || 1);
+      const aspect = naturalW / naturalH;
+
+      // Enforce screen orientation match in Slideshow mode
+      if (DISPLAY_MODE === 'slideshow' && !matchesScreenOrientation(aspect)) {
+        cleanupMediaNode(mediaEl);
+        pumpPreloader();
+        return;
+      }
+
+      readyImageQueue.push({
+        media: mediaEl,
+        isVideo: isVideo,
+        isAnimated: isAnimated,
+        aspect: aspect,
+        naturalW: naturalW,
+        naturalH: naturalH
+      });
+
+      if (DISPLAY_MODE === 'scroll') {
+        fillScrollBuffer();
+      } else if (DISPLAY_MODE === 'slideshow') {
+        if (!currentSlideItem) {
+          advanceSlideshowIfReady();
+        }
+      } else if (fillScreenBurstRemaining > 0) {
+        drainFillScreenBurst();
+      }
+      pumpPreloader();
+    }
+
+    function handleMediaLoadFailure(mediaEl) {
+      if (inFlightMedia.has(mediaEl)) {
+        inFlightMedia.delete(mediaEl);
+        activePreloadCount = Math.max(0, activePreloadCount - 1);
+      }
+      cleanupMediaNode(mediaEl);
+
+      if (APP_PAUSED || !SCREEN_ENABLED) return;
+
+      consecutiveLoadErrors++;
+      const backoffMs = Math.min(10000, 600 * Math.pow(1.6, Math.min(6, consecutiveLoadErrors)));
+      preloaderBackoffUntil = performance.now() + backoffMs;
+
+      setTimeout(pumpPreloader, backoffMs + 50);
+    }
+
+    function pumpPreloader() {
+      if (APP_PAUSED || !SCREEN_ENABLED) return;
+      const now = performance.now();
+      if (now < preloaderBackoffUntil) return;
+
+      if (postQueue.length < LOW_QUEUE_THRESHOLD && !isFetching && now >= nextAllowedFetchTime) {
+        fetchNextPage();
+      }
+
+      while (
+        activePreloadCount < MAX_CONCURRENT_LOADS &&
+        (readyImageQueue.length + activePreloadCount) < preloadBufferTarget &&
+        postQueue.length > 0
+      ) {
+        const post = postQueue.shift();
+        if (!post) continue;
+
+        if (DISPLAY_MODE === 'slideshow' && !postMatchesScreenOrientation(post)) {
+          continue;
+        }
+
+        const localMediaUrl = buildLocalMediaUrl(post);
+        if (!localMediaUrl) continue;
+
+        const ext = String(post.file_ext || '').toLowerCase();
+        const isVideo = (ext === 'mp4') || localMediaUrl.toLowerCase().includes('ext=mp4');
+        const isAnimated = isVideo || (ext === 'gif') || localMediaUrl.toLowerCase().includes('ext=gif');
+
+        activePreloadCount++;
+        const gen = preloadGeneration;
+
+        if (isVideo) {
+          const video = document.createElement('video');
+          enforceSilentVideo(video);
+          video.preload = 'auto';
+          inFlightMedia.add(video);
+
+          let finalized = false;
+
+          const onReady = () => {
+            if (finalized) return;
+            finalized = true;
+            video.onloadeddata = null;
+            video.oncanplay = null;
+            video.onerror = null;
+            finalizePreloadedMedia(video, gen, true, true);
+          };
+
+          video.onloadeddata = onReady;
+          video.oncanplay = onReady;
+
+          video.onerror = () => {
+            if (finalized) return;
+            finalized = true;
+            handleMediaLoadFailure(video);
+          };
+
+          // Strictly route all video traffic through local Python proxy (/media)
+          video.src = localMediaUrl;
+          video.load();
+        } else {
+          const img = new Image();
+          img.decoding = 'async';
+          img.referrerPolicy = 'no-referrer';
+          inFlightMedia.add(img);
+
+          img.onload = () => {
+            if (typeof img.decode === 'function' && !isAnimated) {
+              img.decode()
+                .then(() => finalizePreloadedMedia(img, gen, false, isAnimated))
+                .catch(() => finalizePreloadedMedia(img, gen, false, isAnimated));
+            } else {
+              finalizePreloadedMedia(img, gen, false, isAnimated);
+            }
+          };
+
+          img.onerror = () => {
+            handleMediaLoadFailure(img);
+          };
+
+          // Strictly route all image traffic through local Python proxy (/media)
+          img.src = localMediaUrl;
+        }
+      }
+
+      if (postQueue.length < LOW_QUEUE_THRESHOLD && !isFetching && performance.now() >= nextAllowedFetchTime) {
+        fetchNextPage();
+      }
+    }
+
+    function cleanupMediaNode(node) {
+      if (!node) return;
+      try {
+        if (node.tagName === 'VIDEO') {
+          node.onloadeddata = null;
+          node.oncanplay = null;
+          node.onerror = null;
+          node.pause();
+          node.removeAttribute('src');
+          node.load();
+        } else {
+          node.onload = null;
+          node.onerror = null;
+          node.src = '';
+          node.removeAttribute('src');
+        }
+      } catch (e) {}
+    }
+
+    function destroyItem(item) {
+      if (!item) return;
+      const el = item.element;
+      const media = item.mediaElement || (
+        el && (el.tagName === 'IMG' || el.tagName === 'VIDEO')
+          ? el
+          : (el ? el.querySelector('img, video') : null)
+      );
+      if (media) {
+        cleanupMediaNode(media);
+      }
+      if (el && el.parentNode) {
+        el.parentNode.removeChild(el);
+      }
+      item.element = null;
+      item.mediaElement = null;
+    }
+
+    function clearReadyQueue() {
+      preloadGeneration++;
+
+      for (const media of inFlightMedia) {
+        cleanupMediaNode(media);
+      }
+      inFlightMedia.clear();
+      activePreloadCount = 0;
+
+      while (readyImageQueue.length > 0) {
+        const preloaded = readyImageQueue.shift();
+        if (preloaded && preloaded.media) {
+          cleanupMediaNode(preloaded.media);
+        }
+      }
+    }
+
+    function filterQueuesForSlideshowOrientation() {
+      postQueue = postQueue.filter(postMatchesScreenOrientation);
+      const keptReady = [];
+      while (readyImageQueue.length > 0) {
+        const item = readyImageQueue.shift();
+        if (matchesScreenOrientation(item.aspect)) {
+          keptReady.push(item);
+        } else if (item.media) {
+          cleanupMediaNode(item.media);
+        }
+      }
+      readyImageQueue = keptReady;
+    }
+
+    function clearStageAll() {
+      for (let i = 0; i < activeItems.length; i++) destroyItem(activeItems[i]);
+      for (let i = 0; i < collageItems.length; i++) destroyItem(collageItems[i]);
+      for (let i = 0; i < fallingItems.length; i++) destroyItem(fallingItems[i]);
+      if (currentSlideItem) destroyItem(currentSlideItem);
+      if (previousSlideItem) destroyItem(previousSlideItem);
+
+      activeItems = [];
+      collageItems = [];
+      fallingItems = [];
+      currentSlideItem = null;
+      previousSlideItem = null;
+      slideshowTimer = 0;
+      slideshowFadeElapsed = 0;
+      slideshowIsFading = false;
+
+      clearCollageCanvas();
+      coverageGrid.fill(0);
+      coveredCellCount = 0;
+      screenFullyCovered = false;
+      nextZIndex = 1;
+      timeSinceLastDrop = 999;
+      fillScreenBurstRemaining = 0;
+    }
+
+    function switchDisplayMode(newMode) {
+      if (newMode !== 'scroll' && newMode !== 'collage' && newMode !== 'slideshow') return;
+      if (DISPLAY_MODE === newMode) return;
+      DISPLAY_MODE = newMode;
+      clearStageAll();
+
+      if (DISPLAY_MODE === 'collage' && SCREEN_ENABLED) {
+        resizeCollageCanvas(false);
+        collageBaseCanvas.style.display = 'block';
+      } else {
+        collageBaseCanvas.style.display = 'none';
+      }
+
+      if (DISPLAY_MODE === 'slideshow') {
+        filterQueuesForSlideshowOrientation();
+        advanceSlideshowIfReady();
+      } else if (DISPLAY_MODE === 'scroll') {
+        fillScrollBuffer();
+      }
+
+      pumpPreloader();
+    }
+
+    // =========================================================================
+    // MODE 1: INFINITE CONTINUOUS SCROLL (LEFT, RIGHT, UP, DOWN)
+    // =========================================================================
+    function getRightmostEdge() {
+      if (activeItems.length === 0) return 0;
+      const last = activeItems[activeItems.length - 1];
+      return last.x + last.width;
+    }
+
+    function getLeftmostEdge() {
+      if (activeItems.length === 0) return window.innerWidth;
+      return activeItems[0].x;
+    }
+
+    function getBottommostEdge() {
+      if (activeItems.length === 0) return 0;
+      const last = activeItems[activeItems.length - 1];
+      return last.y + last.height;
+    }
+
+    function getTopmostEdge() {
+      if (activeItems.length === 0) return window.innerHeight;
+      return activeItems[0].y;
+    }
+
+    function fillScrollBuffer() {
+      if (DISPLAY_MODE !== 'scroll' || APP_PAUSED || !SCREEN_ENABLED) return;
+
+      const screenW = window.innerWidth;
+      const screenH = window.innerHeight;
+      if (screenW <= 0 || screenH <= 0) return;
+
+      let spawnedAny = false;
+
+      if (SCROLL_DIRECTION === 'left') {
+        while (readyImageQueue.length > 0 && getRightmostEdge() < screenW * 3.5) {
+          const ready = readyImageQueue.shift();
+          const media = ready.media;
+          const computedWidth = Math.max(1, ready.aspect * screenH);
+          const spawnX = activeItems.length === 0 ? 0 : getRightmostEdge() + GAP;
+
+          media.className = 'slide-item';
+          media.style.width = `${computedWidth}px`;
+          media.style.height = `${screenH}px`;
+          media.style.transform = `translate3d(${spawnX}px, 0, 0)`;
+          stage.appendChild(media);
+
+          if (ready.isVideo) {
+            enforceSilentVideo(media);
+            media.play().catch(() => {});
+          }
+
+          activeItems.push({
+            element: media,
+            mediaElement: media,
+            isVideo: ready.isVideo,
+            isAnimated: ready.isAnimated,
+            x: spawnX,
+            y: 0,
+            width: computedWidth,
+            height: screenH,
+            aspect: ready.aspect
+          });
+          spawnedAny = true;
+        }
+      } else if (SCROLL_DIRECTION === 'right') {
+        while (readyImageQueue.length > 0 && getLeftmostEdge() > -screenW * 2.5) {
+          const ready = readyImageQueue.shift();
+          const media = ready.media;
+          const computedWidth = Math.max(1, ready.aspect * screenH);
+          const spawnX = activeItems.length === 0
+            ? (screenW - computedWidth)
+            : (getLeftmostEdge() - computedWidth - GAP);
+
+          media.className = 'slide-item';
+          media.style.width = `${computedWidth}px`;
+          media.style.height = `${screenH}px`;
+          media.style.transform = `translate3d(${spawnX}px, 0, 0)`;
+          stage.appendChild(media);
+
+          if (ready.isVideo) {
+            enforceSilentVideo(media);
+            media.play().catch(() => {});
+          }
+
+          activeItems.unshift({
+            element: media,
+            mediaElement: media,
+            isVideo: ready.isVideo,
+            isAnimated: ready.isAnimated,
+            x: spawnX,
+            y: 0,
+            width: computedWidth,
+            height: screenH,
+            aspect: ready.aspect
+          });
+          spawnedAny = true;
+        }
+      } else if (SCROLL_DIRECTION === 'up') {
+        while (readyImageQueue.length > 0 && getBottommostEdge() < screenH * 3.5) {
+          const ready = readyImageQueue.shift();
+          const media = ready.media;
+          const computedHeight = Math.max(1, screenW / Math.max(0.05, ready.aspect));
+          const spawnY = activeItems.length === 0 ? 0 : getBottommostEdge() + GAP;
+
+          media.className = 'slide-item';
+          media.style.width = `${screenW}px`;
+          media.style.height = `${computedHeight}px`;
+          media.style.transform = `translate3d(0, ${spawnY}px, 0)`;
+          stage.appendChild(media);
+
+          if (ready.isVideo) {
+            enforceSilentVideo(media);
+            media.play().catch(() => {});
+          }
+
+          activeItems.push({
+            element: media,
+            mediaElement: media,
+            isVideo: ready.isVideo,
+            isAnimated: ready.isAnimated,
+            x: 0,
+            y: spawnY,
+            width: screenW,
+            height: computedHeight,
+            aspect: ready.aspect
+          });
+          spawnedAny = true;
+        }
+      } else if (SCROLL_DIRECTION === 'down') {
+        while (readyImageQueue.length > 0 && getTopmostEdge() > -screenH * 2.5) {
+          const ready = readyImageQueue.shift();
+          const media = ready.media;
+          const computedHeight = Math.max(1, screenW / Math.max(0.05, ready.aspect));
+          const spawnY = activeItems.length === 0
+            ? (screenH - computedHeight)
+            : (getTopmostEdge() - computedHeight - GAP);
+
+          media.className = 'slide-item';
+          media.style.width = `${screenW}px`;
+          media.style.height = `${computedHeight}px`;
+          media.style.transform = `translate3d(0, ${spawnY}px, 0)`;
+          stage.appendChild(media);
+
+          if (ready.isVideo) {
+            enforceSilentVideo(media);
+            media.play().catch(() => {});
+          }
+
+          activeItems.unshift({
+            element: media,
+            mediaElement: media,
+            isVideo: ready.isVideo,
+            isAnimated: ready.isAnimated,
+            x: 0,
+            y: spawnY,
+            width: screenW,
+            height: computedHeight,
+            aspect: ready.aspect
+          });
+          spawnedAny = true;
+        }
+      }
+
+      if (spawnedAny || (readyImageQueue.length === 0 && activePreloadCount === 0)) {
+        pumpPreloader();
+      }
+    }
+
+    function relayoutScrollItems() {
+      if (DISPLAY_MODE !== 'scroll' || activeItems.length === 0) return;
+      const screenWidth = window.innerWidth;
+      const screenHeight = window.innerHeight;
+      if (screenWidth <= 0 || screenHeight <= 0) return;
+
+      if (isHorizontalScroll()) {
+        let runningX = activeItems[0].x;
+        for (let i = 0; i < activeItems.length; i++) {
+          const item = activeItems[i];
+          item.width = Math.max(1, item.aspect * screenHeight);
+          item.height = screenHeight;
+          item.x = runningX;
+          item.y = 0;
+          item.element.style.width = `${item.width}px`;
+          item.element.style.height = `${screenHeight}px`;
+          item.element.style.transform = `translate3d(${item.x}px, 0, 0)`;
+          runningX += item.width + GAP;
+        }
+      } else {
+        let runningY = activeItems[0].y;
+        for (let i = 0; i < activeItems.length; i++) {
+          const item = activeItems[i];
+          item.width = screenWidth;
+          item.height = Math.max(1, screenWidth / Math.max(0.05, item.aspect));
+          item.x = 0;
+          item.y = runningY;
+          item.element.style.width = `${screenWidth}px`;
+          item.element.style.height = `${item.height}px`;
+          item.element.style.transform = `translate3d(0, ${item.y}px, 0)`;
+          runningY += item.height + GAP;
+        }
+      }
+      fillScrollBuffer();
+    }
+
+    function updateScrollMode(deltaTime) {
+      if (WALLPAPER_PAUSED) return;
+
+      const moveBy = SCROLL_SPEED * deltaTime;
+      let removedAny = false;
+
+      if (SCROLL_DIRECTION === 'left') {
+        for (let i = 0; i < activeItems.length; i++) {
+          const item = activeItems[i];
+          item.x -= moveBy;
+          item.element.style.transform = `translate3d(${item.x}px, 0, 0)`;
+        }
+        while (activeItems.length > 0 && (activeItems[0].x + activeItems[0].width) < -100) {
+          destroyItem(activeItems.shift());
+          removedAny = true;
+        }
+      } else if (SCROLL_DIRECTION === 'right') {
+        for (let i = 0; i < activeItems.length; i++) {
+          const item = activeItems[i];
+          item.x += moveBy;
+          item.element.style.transform = `translate3d(${item.x}px, 0, 0)`;
+        }
+        while (activeItems.length > 0 && activeItems[activeItems.length - 1].x > window.innerWidth + 100) {
+          destroyItem(activeItems.pop());
+          removedAny = true;
+        }
+      } else if (SCROLL_DIRECTION === 'up') {
+        for (let i = 0; i < activeItems.length; i++) {
+          const item = activeItems[i];
+          item.y -= moveBy;
+          item.element.style.transform = `translate3d(0, ${item.y}px, 0)`;
+        }
+        while (activeItems.length > 0 && (activeItems[0].y + activeItems[0].height) < -100) {
+          destroyItem(activeItems.shift());
+          removedAny = true;
+        }
+      } else if (SCROLL_DIRECTION === 'down') {
+        for (let i = 0; i < activeItems.length; i++) {
+          const item = activeItems[i];
+          item.y += moveBy;
+          item.element.style.transform = `translate3d(0, ${item.y}px, 0)`;
+        }
+        while (activeItems.length > 0 && activeItems[activeItems.length - 1].y > window.innerHeight + 100) {
+          destroyItem(activeItems.pop());
+          removedAny = true;
+        }
+      }
+
+      if (removedAny || readyImageQueue.length > 0 || activeItems.length === 0) {
+        fillScrollBuffer();
+      }
+    }
+
+    // =========================================================================
+    // MODE 2: CONTINUOUS STACKING POLAROID COLLAGE
+    // =========================================================================
+    function chooseSmartLandingSpot(totalW, totalH) {
+      const sw = window.innerWidth;
+      const sh = window.innerHeight;
+      const cellW = sw / GRID_COLS;
+      const cellH = sh / GRID_ROWS;
+
+      if (!screenFullyCovered && Math.random() < 0.85) {
+        const uncoveredIndices = [];
+        for (let i = 0; i < TOTAL_GRID_CELLS; i++) {
+          if (coverageGrid[i] === 0) uncoveredIndices.push(i);
+        }
+        if (uncoveredIndices.length > 0) {
+          const chosenIdx = uncoveredIndices[Math.floor(Math.random() * uncoveredIndices.length)];
+          const col = chosenIdx % GRID_COLS;
+          const row = Math.floor(chosenIdx / GRID_COLS);
+
+          const jitterX = (Math.random() - 0.5) * cellW * 3;
+          const jitterY = (Math.random() - 0.5) * cellH * 3;
+          const centerX = (col + 0.5) * cellW + jitterX;
+          const centerY = (row + 0.5) * cellH + jitterY;
+
+          return {
+            x: centerX - totalW / 2,
+            y: centerY - totalH / 2
+          };
+        }
+      }
+
+      if (collageItems.length > 0 && Math.random() < 0.35) {
+        const oldestId = collageItems[0].id;
+        const oldestCells = [];
+        for (let i = 0; i < TOTAL_GRID_CELLS; i++) {
+          if (coverageGrid[i] === oldestId) oldestCells.push(i);
+        }
+        if (oldestCells.length > 0) {
+          const chosenIdx = oldestCells[Math.floor(Math.random() * oldestCells.length)];
+          const col = chosenIdx % GRID_COLS;
+          const row = Math.floor(chosenIdx / GRID_COLS);
+
+          const jitterX = (Math.random() - 0.5) * totalW * 0.35;
+          const jitterY = (Math.random() - 0.5) * totalH * 0.35;
+          const centerX = (col + 0.5) * cellW + jitterX;
+          const centerY = (row + 0.5) * cellH + jitterY;
+
+          return {
+            x: centerX - totalW / 2,
+            y: centerY - totalH / 2
+          };
+        }
+      }
+
+      const marginX = totalW * 0.2;
+      const marginY = totalH * 0.2;
+      const x = -marginX + Math.random() * (sw - totalW + marginX * 2);
+      const y = -marginY + Math.random() * (sh - totalH + marginY * 2);
+      return { x, y };
+    }
+
+    function markCoverageForLandedItem(item) {
+      const sw = window.innerWidth;
+      const sh = window.innerHeight;
+      if (sw <= 0 || sh <= 0) return;
+
+      const cellW = sw / GRID_COLS;
+      const cellH = sh / GRID_ROWS;
+
+      const cx = item.targetX + item.totalW / 2;
+      const cy = item.targetY + item.totalH / 2;
+
+      const halfW = Math.max(10, item.totalW / 2 - COVERAGE_INSET_PX);
+      const halfH = Math.max(10, item.totalH / 2 - COVERAGE_INSET_PX);
+
+      const rad = (-item.targetRot * Math.PI) / 180;
+      const cosA = Math.cos(rad);
+      const sinA = Math.sin(rad);
+
+      for (let r = 0; r < GRID_ROWS; r++) {
+        const py = (r + 0.5) * cellH - cy;
+        for (let c = 0; c < GRID_COLS; c++) {
+          const px = (c + 0.5) * cellW - cx;
+          const localX = px * cosA - py * sinA;
+          const localY = px * sinA + py * cosA;
+
+          if (Math.abs(localX) <= halfW && Math.abs(localY) <= halfH) {
+            const idx = r * GRID_COLS + c;
+            if (coverageGrid[idx] === 0) {
+              coveredCellCount++;
+            }
+            coverageGrid[idx] = item.id;
+          }
+        }
+      }
+
+      if (coveredCellCount >= TOTAL_GRID_CELLS * 0.985) {
+        screenFullyCovered = true;
+      }
+    }
+
+    function pruneCollageStackIfNeeded() {
+      const visibleIds = new Set(coverageGrid);
+      const remaining = [];
+
+      for (let i = 0; i < collageItems.length; i++) {
+        const item = collageItems[i];
+        if (!visibleIds.has(item.id)) {
+          item.occludedDrops = (item.occludedDrops || 0) + 1;
+        } else {
+          item.occludedDrops = 0;
+        }
+
+        if (item.occludedDrops >= OCCLUDED_GRACE_DROPS) {
+          bakePolaroidToCanvas(item);
+          destroyItem(item);
+        } else {
+          remaining.push(item);
+        }
+      }
+      collageItems = remaining;
+
+      let idx = 0;
+      while (collageItems.length > MAX_LIVE_COLLAGE_DOM && idx < collageItems.length) {
+        if (!collageItems[idx].isAnimated) {
+          const [staticItem] = collageItems.splice(idx, 1);
+          bakePolaroidToCanvas(staticItem);
+          destroyItem(staticItem);
+        } else {
+          idx++;
+        }
+      }
+
+      while (collageItems.length > MAX_LIVE_COLLAGE_DOM + 10) {
+        const oldest = collageItems.shift();
+        bakePolaroidToCanvas(oldest);
+        destroyItem(oldest);
+      }
+    }
+
+    function spawnNextCollageItem() {
+      if (DISPLAY_MODE !== 'collage' || readyImageQueue.length === 0 || APP_PAUSED || !SCREEN_ENABLED) {
+        pumpPreloader();
+        return false;
+      }
+      if (window.innerWidth <= 0 || window.innerHeight <= 0) {
+        return false;
+      }
+
+      const ready = readyImageQueue.shift();
+      pumpPreloader();
+
+      const media = ready.media;
+      const aspect = ready.aspect;
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'polaroid-item falling';
+      wrapper.style.opacity = '0';
+
+      media.className = 'polaroid-img';
+      wrapper.appendChild(media);
+      stage.appendChild(wrapper);
+
+      if (ready.isVideo) {
+        enforceSilentVideo(media);
+        media.play().catch(() => {});
+      }
+
+      const minS = Math.min(COLLAGE_MIN_SIZE, COLLAGE_MAX_SIZE);
+      const maxS = Math.max(COLLAGE_MIN_SIZE, COLLAGE_MAX_SIZE);
+      const randomBaseSize = minS + Math.random() * (maxS - minS);
+
+      let imgW, imgH;
+      if (aspect >= 1) {
+        imgW = randomBaseSize;
+        imgH = randomBaseSize / aspect;
+      } else {
+        imgH = randomBaseSize;
+        imgW = randomBaseSize * aspect;
+      }
+
+      const totalW = Math.round(imgW + POLAROID_PAD_SIDE * 2);
+      const totalH = Math.round(imgH + POLAROID_PAD_TOP + POLAROID_PAD_BOTTOM);
+
+      wrapper.style.width = `${totalW}px`;
+      wrapper.style.height = `${totalH}px`;
+      wrapper.style.zIndex = String(nextZIndex++);
+
+      const landing = chooseSmartLandingSpot(totalW, totalH);
+      const targetRot = (Math.random() - 0.5) * 28;
+      const startRot = targetRot + (Math.random() - 0.5) * 30;
+
+      const startX = (window.innerWidth - totalW) * 0.5 + (landing.x - (window.innerWidth - totalW) * 0.5) * 0.35;
+      const startY = (window.innerHeight - totalH) * 0.5 + (landing.y - (window.innerHeight - totalH) * 0.5) * 0.35;
+
+      const fallDuration = Math.max(0.25, 1.15 / Math.max(0.2, COLLAGE_DROP_SPEED));
+
+      const itemObj = {
+        id: nextPolaroidId++,
+        element: wrapper,
+        mediaElement: media,
+        isVideo: ready.isVideo,
+        isAnimated: ready.isAnimated,
+        totalW,
+        totalH,
+        startX,
+        startY,
+        targetX: landing.x,
+        targetY: landing.y,
+        startScale: 3.6,
+        targetScale: 1.0,
+        startRot,
+        targetRot,
+        elapsed: 0,
+        duration: fallDuration,
+        occludedDrops: 0
+      };
+
+      markCoverageForLandedItem(itemObj);
+      fallingItems.push(itemObj);
+
+      return true;
+    }
+
+    function updateCollageMode(deltaTime) {
+      if (WALLPAPER_PAUSED) return;
+
+      if (fillScreenBurstRemaining > 0) {
+        drainFillScreenBurst();
+      } else {
+        timeSinceLastDrop += deltaTime;
+        const baseInterval = Math.max(0.25, 1.6 / Math.max(0.2, COLLAGE_DROP_SPEED));
+        const spawnInterval = baseInterval + Math.max(0, Math.min(600, COLLAGE_DROP_DELAY));
+
+        if (timeSinceLastDrop >= spawnInterval) {
+          if (spawnNextCollageItem()) {
+            timeSinceLastDrop = 0;
+          } else {
+            timeSinceLastDrop = spawnInterval - 0.25;
+          }
+        }
+      }
+
+      for (let i = fallingItems.length - 1; i >= 0; i--) {
+        const item = fallingItems[i];
+        item.elapsed += deltaTime;
+        const progress = Math.min(item.elapsed / item.duration, 1.0);
+        const ease = 1 - Math.pow(1 - progress, 3);
+
+        const curX = item.startX + (item.targetX - item.startX) * ease;
+        const curY = item.startY + (item.targetY - item.startY) * ease;
+        const curScale = item.startScale + (item.targetScale - item.startScale) * ease;
+        const curRot = item.startRot + (item.targetRot - item.startRot) * ease;
+        const curOpacity = Math.min(progress / 0.15, 1.0);
+
+        item.element.style.opacity = curOpacity.toFixed(3);
+        item.element.style.transform = `translate3d(${curX.toFixed(1)}px, ${curY.toFixed(1)}px, 0) scale(${curScale.toFixed(4)}) rotate(${curRot.toFixed(2)}deg)`;
+
+        if (progress >= 1.0) {
+          item.element.classList.remove('falling');
+          item.element.style.willChange = 'auto';
+          item.element.style.opacity = '1';
+          item.element.style.transform = `translate3d(${item.targetX.toFixed(1)}px, ${item.targetY.toFixed(1)}px, 0) scale(1) rotate(${item.targetRot.toFixed(2)}deg)`;
+
+          fallingItems.splice(i, 1);
+          collageItems.push(item);
+
+          pruneCollageStackIfNeeded();
+        }
+      }
+    }
+
+    // =========================================================================
+    // MODE 3: FULLSCREEN ORIENTATION-MATCHED SLIDESHOW WITH FADE TRANSITION
+    // =========================================================================
+    function popNextOrientationMatchedSlide() {
+      while (readyImageQueue.length > 0) {
+        const candidate = readyImageQueue.shift();
+        if (matchesScreenOrientation(candidate.aspect)) {
+          return candidate;
+        }
+        if (candidate && candidate.media) {
+          cleanupMediaNode(candidate.media);
+        }
+      }
+      return null;
+    }
+
+    function advanceSlideshowIfReady() {
+      if (DISPLAY_MODE !== 'slideshow' || APP_PAUSED || !SCREEN_ENABLED || slideshowIsFading) {
+        return false;
+      }
+
+      const nextReady = popNextOrientationMatchedSlide();
+      pumpPreloader();
+      if (!nextReady) return false;
+
+      const media = nextReady.media;
+      media.className = 'slideshow-item';
+      media.style.zIndex = '2';
+
+      // Slider 0..10 maps linearly to 0.0s..1.0s fade transition
+      const fadeSec = Math.max(0, Math.min(10, SLIDESHOW_FADE)) / 10.0;
+
+      if (!currentSlideItem || fadeSec <= 0.005) {
+        media.style.opacity = '1';
+        stage.appendChild(media);
+        if (nextReady.isVideo) {
+          enforceSilentVideo(media);
+          media.play().catch(() => {});
+        }
+        if (previousSlideItem) {
+          destroyItem(previousSlideItem);
+          previousSlideItem = null;
+        }
+        if (currentSlideItem) {
+          destroyItem(currentSlideItem);
+        }
+        currentSlideItem = {
+          element: media,
+          mediaElement: media,
+          isVideo: nextReady.isVideo,
+          isAnimated: nextReady.isAnimated,
+          aspect: nextReady.aspect
+        };
+        slideshowTimer = 0;
+        slideshowIsFading = false;
+      } else {
+        if (previousSlideItem) {
+          destroyItem(previousSlideItem);
+        }
+        previousSlideItem = currentSlideItem;
+        if (previousSlideItem && previousSlideItem.element) {
+          previousSlideItem.element.style.zIndex = '1';
+          previousSlideItem.element.style.opacity = '1';
+        }
+
+        media.style.opacity = '0';
+        stage.appendChild(media);
+        if (nextReady.isVideo) {
+          enforceSilentVideo(media);
+          media.play().catch(() => {});
+        }
+
+        currentSlideItem = {
+          element: media,
+          mediaElement: media,
+          isVideo: nextReady.isVideo,
+          isAnimated: nextReady.isAnimated,
+          aspect: nextReady.aspect
+        };
+        slideshowFadeElapsed = 0;
+        activeFadeDurationSec = fadeSec;
+        slideshowIsFading = true;
+        slideshowTimer = 0;
+      }
+
+      return true;
+    }
+
+    function updateSlideshowMode(deltaTime) {
+      if (WALLPAPER_PAUSED) return;
+
+      if (slideshowIsFading) {
+        slideshowFadeElapsed += deltaTime;
+        const progress = activeFadeDurationSec > 0
+          ? Math.min(1.0, slideshowFadeElapsed / activeFadeDurationSec)
+          : 1.0;
+
+        if (currentSlideItem && currentSlideItem.element) {
+          currentSlideItem.element.style.opacity = progress.toFixed(3);
+        }
+        if (previousSlideItem && previousSlideItem.element) {
+          previousSlideItem.element.style.opacity = (1.0 - progress).toFixed(3);
+        }
+
+        if (progress >= 1.0) {
+          if (currentSlideItem && currentSlideItem.element) {
+            currentSlideItem.element.style.opacity = '1';
+          }
+          if (previousSlideItem) {
+            destroyItem(previousSlideItem);
+            previousSlideItem = null;
+          }
+          slideshowIsFading = false;
+          slideshowTimer = 0;
+        }
+        return;
+      }
+
+      if (!currentSlideItem) {
+        advanceSlideshowIfReady();
+        return;
+      }
+
+      slideshowTimer += deltaTime;
+      const holdSeconds = Math.max(0.25, Math.min(600, Number(SLIDESHOW_DURATION) || 0));
+      if (slideshowTimer >= holdSeconds) {
+        if (!advanceSlideshowIfReady()) {
+          slideshowTimer = Math.max(0, holdSeconds - 0.25);
+        }
+      }
+    }
+
+    // =========================================================================
+    // MAIN ANIMATION LOOP & RESIZE HANDLING
+    // =========================================================================
+    window.addEventListener('resize', () => {
+      if (DISPLAY_MODE === 'scroll') {
+        relayoutScrollItems();
+      } else if (DISPLAY_MODE === 'slideshow') {
+        filterQueuesForSlideshowOrientation();
+        if (currentSlideItem && !matchesScreenOrientation(currentSlideItem.aspect)) {
+          advanceSlideshowIfReady();
+        }
+        pumpPreloader();
+      } else {
+        resizeCollageCanvas(true);
+        coverageGrid.fill(0);
+        coveredCellCount = 0;
+        screenFullyCovered = false;
+        for (let i = 0; i < collageItems.length; i++) {
+          markCoverageForLandedItem(collageItems[i]);
+        }
+      }
+    });
+
+    function animate(currentTime) {
+      if (lastTime === null) {
+        lastTime = currentTime;
+      }
+      const rawDelta = (currentTime - lastTime) / 1000;
+      const deltaTime = rawDelta > 0 ? Math.min(rawDelta, 0.25) : 0;
+      lastTime = currentTime;
+
+      if (!APP_PAUSED && SCREEN_ENABLED) {
+        if (DISPLAY_MODE === 'scroll') {
+          updateScrollMode(deltaTime);
+        } else if (DISPLAY_MODE === 'slideshow') {
+          updateSlideshowMode(deltaTime);
+        } else {
+          updateCollageMode(deltaTime);
+        }
+      }
+
+      requestAnimationFrame(animate);
+    }
+
+    // =========================================================================
+    // EPOCH & PAUSE STATE POLLING
+    // =========================================================================
+    setInterval(async () => {
+      try {
+        const res = await fetch(`${LOCAL_ORIGIN}/epoch?screen=${encodeURIComponent(SCREEN_ID)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (typeof data.app_paused === 'boolean' || typeof data.wallpaper_paused === 'boolean') {
+            window.applyPauseStates(data.app_paused, data.wallpaper_paused);
+          }
+
+          if (currentEpoch === null) {
+            currentEpoch = data.epoch;
+            return;
+          }
+
+          if (data.epoch !== currentEpoch) {
+            currentEpoch = data.epoch;
+            postQueue = [];
+            consecutiveEmptyFetches = 0;
+            consecutiveLoadErrors = 0;
+            preloaderBackoffUntil = 0;
+            nextAllowedFetchTime = 0;
+            clearReadyQueue();
+
+            if (!APP_PAUSED && SCREEN_ENABLED) {
+              if (DISPLAY_MODE === 'scroll') {
+                const visibleItems = [];
+                for (let i = 0; i < activeItems.length; i++) {
+                  const item = activeItems[i];
+                  const isVisible = isHorizontalScroll()
+                    ? ((item.x + item.width > 0) && (item.x < window.innerWidth))
+                    : ((item.y + item.height > 0) && (item.y < window.innerHeight));
+                  if (isVisible) {
+                    visibleItems.push(item);
+                  } else {
+                    destroyItem(item);
+                  }
+                }
+                activeItems = visibleItems;
+                await fetchNextPage(true);
+                fillScrollBuffer();
+              } else if (DISPLAY_MODE === 'slideshow') {
+                slideshowTimer = 999999;
+                await fetchNextPage(true);
+              } else {
+                await fetchNextPage(true);
+              }
+            }
+          }
+        }
+      } catch (e) {}
+    }, 1000);
+
+    // =========================================================================
+    // WALLPAPER ENGINE PROPERTY LISTENER
+    // =========================================================================
+    window.wallpaperPropertyListener = {
+      applyUserProperties: function(properties) {
+        if (!properties) return;
+        if (properties.schemecolor && properties.schemecolor.value) {
+          const parts = String(properties.schemecolor.value).trim().split(/\s+/).map(Number);
+          if (parts.length >= 3 && !parts.some(isNaN)) {
+            const r = Math.round(Math.min(1, Math.max(0, parts[0])) * 255);
+            const g = Math.round(Math.min(1, Math.max(0, parts[1])) * 255);
+            const b = Math.round(Math.min(1, Math.max(0, parts[2])) * 255);
+            document.body.style.backgroundColor = `rgb(${r}, ${g}, ${b})`;
+          }
+        }
+        if (properties.scrolldirection && properties.scrolldirection.value) {
+          const val = String(properties.scrolldirection.value).toLowerCase();
+          const allowedDirs = ['left', 'right', 'up', 'down'];
+          const newDir = allowedDirs.includes(val) ? val : 'left';
+          if (SCROLL_DIRECTION !== newDir) {
+            const axisChanged = (SCROLL_DIRECTION === 'left' || SCROLL_DIRECTION === 'right') !==
+                                (newDir === 'left' || newDir === 'right');
+            SCROLL_DIRECTION = newDir;
+            if (DISPLAY_MODE === 'scroll') {
+              if (axisChanged) {
+                for (let i = 0; i < activeItems.length; i++) {
+                  const it = activeItems[i];
+                  if (it.mediaElement) {
+                    readyImageQueue.unshift({
+                      media: it.mediaElement,
+                      isVideo: it.isVideo,
+                      isAnimated: it.isAnimated,
+                      aspect: it.aspect,
+                      naturalW: 1,
+                      naturalH: 1
+                    });
+                    if (it.element && it.element.parentNode) {
+                      it.element.parentNode.removeChild(it.element);
+                    }
+                  }
+                }
+                activeItems = [];
+              }
+              fillScrollBuffer();
+            }
+          }
+        }
+        if (properties.scrollspeed !== undefined && properties.scrollspeed !== null) {
+          const parsedSpeed = Number(properties.scrollspeed.value);
+          if (Number.isFinite(parsedSpeed) && parsedSpeed >= 0) {
+            SCROLL_SPEED = parsedSpeed;
+          }
+        }
+        if (properties.gapsize !== undefined) {
+          GAP = Number(properties.gapsize.value);
+          if (DISPLAY_MODE === 'scroll') relayoutScrollItems();
+        }
+        if (properties.dropspeed) {
+          COLLAGE_DROP_SPEED = Number(properties.dropspeed.value) || 1.0;
+        }
+        if (properties.minsize) {
+          COLLAGE_MIN_SIZE = Number(properties.minsize.value) || 220;
+          if (COLLAGE_MIN_SIZE > COLLAGE_MAX_SIZE) COLLAGE_MAX_SIZE = COLLAGE_MIN_SIZE;
+        }
+        if (properties.maxsize) {
+          COLLAGE_MAX_SIZE = Number(properties.maxsize.value) || 440;
+          if (COLLAGE_MAX_SIZE < COLLAGE_MIN_SIZE) COLLAGE_MIN_SIZE = COLLAGE_MAX_SIZE;
+        }
+        if (properties.dropdelay !== undefined) {
+          const rawDelay = Number(properties.dropdelay.value);
+          COLLAGE_DROP_DELAY = isNaN(rawDelay) ? 0 : Math.max(0, Math.min(600, rawDelay));
+        }
+        if (properties.slideshowfade !== undefined && properties.slideshowfade !== null) {
+          const rawFade = Number(properties.slideshowfade.value);
+          SLIDESHOW_FADE = isNaN(rawFade) ? 5.0 : Math.max(0, Math.min(10, rawFade));
+        }
+        if (properties.slideshowduration !== undefined && properties.slideshowduration !== null) {
+          const rawDur = Number(properties.slideshowduration.value);
+          SLIDESHOW_DURATION = isNaN(rawDur) ? 10 : Math.max(0, Math.min(600, rawDur));
+        }
+        if (properties.displaymode && properties.displaymode.value) {
+          switchDisplayMode(properties.displaymode.value);
+        }
+      }
+    };
+
+    async function init() {
+      resizeCollageCanvas(false);
+      try {
+        const propRes = await fetch(`${LOCAL_ORIGIN}/properties?screen=${encodeURIComponent(SCREEN_ID)}`);
+        if (propRes.ok) {
+          const payload = await propRes.json();
+          const props = payload.properties || payload;
+          if (window.wallpaperPropertyListener && window.wallpaperPropertyListener.applyUserProperties) {
+            window.wallpaperPropertyListener.applyUserProperties(props);
+          }
+          if (typeof payload.enabled === 'boolean') {
+            window.setScreenEnabled(payload.enabled);
+          }
+          if (typeof payload.app_paused === 'boolean' || typeof payload.wallpaper_paused === 'boolean') {
+            window.applyPauseStates(payload.app_paused, payload.wallpaper_paused);
+          }
+        }
+      } catch (e) {}
+
+      if (SCREEN_ENABLED && !APP_PAUSED) {
+        await fetchNextPage(true);
+      }
+      requestAnimationFrame(animate);
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
